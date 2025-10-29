@@ -1,64 +1,91 @@
 # app.py
+# Streamlit app that auto-installs kaggle, validates credentials,
+# downloads Sentiment140, trains TF-IDF+LogReg, and exposes demo UI.
+#
+# Run: streamlit run app.py
+# Requirements: Python 3.8+. The app will attempt to pip-install missing packages.
 
 import os
-import zipfile
-import io
+import sys
+import subprocess
 import time
+import zipfile
 import re
+import io
+
+# ---- Auto-install required packages if missing ----
+def ensure_package(pkg_name):
+    try:
+        __import__(pkg_name)
+    except Exception:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg_name])
+        time.sleep(0.5)  # allow environment to settle
+
+for p in ("streamlit", "pandas", "numpy", "scikit-learn", "joblib", "matplotlib", "kaggle"):
+    ensure_package(p)
+
+# Now safe to import heavier libs
 import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_curve, auc, precision_recall_curve, average_precision_score
 import matplotlib.pyplot as plt
 import joblib
+from kaggle.api.kaggle_api_extended import KaggleApi
 
-# -----------------------
-# Kaggle download helper
-# -----------------------
-def download_sentiment140_kaggle(target_dir="data"):
-    """Download Sentiment140 from Kaggle into target_dir and return csv path."""
+# ---- Utilities ----
+def has_kaggle_credentials():
+    # env-vars override
+    if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
+        return True, "env"
+    # default file location
+    home = os.path.expanduser("~")
+    path = os.path.join(home, ".kaggle", "kaggle.json")
+    if os.path.exists(path):
+        return True, path
+    return False, None
+
+def validate_kaggle_access():
+    ok, loc = has_kaggle_credentials()
+    if not ok:
+        return False, "Kaggle credentials not found. Provide ~/.kaggle/kaggle.json or set KAGGLE_USERNAME/KAGGLE_KEY env vars."
     try:
-        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        return True, "Authenticated"
     except Exception as e:
-        raise RuntimeError("kaggle package not found. Install with `pip install kaggle`.") from e
+        return False, f"Kaggle authentication failed: {e}"
 
+def download_sentiment140_kaggle(target_dir="data"):
     os.makedirs(target_dir, exist_ok=True)
     api = KaggleApi()
     api.authenticate()
     dataset = "kazanova/sentiment140"
-    # This downloads a zip file into target_dir
-    zip_path = os.path.join(target_dir, "sentiment140.zip")
+    # downloads dataset zip into target_dir (may create zip)
     api.dataset_download_files(dataset, path=target_dir, unzip=False, quiet=False)
-    # Kaggle API creates a zip named like dataset.zip in target_dir
-    # Find the zip file produced
-    # If API already unzips in some envs, attempt to find csv
-    possible_csvs = [
+    # find zip(s) and extract
+    zfiles = [os.path.join(target_dir, f) for f in os.listdir(target_dir) if f.endswith(".zip")]
+    for zf in zfiles:
+        with zipfile.ZipFile(zf, "r") as z:
+            z.extractall(target_dir)
+    # known filenames
+    candidates = [
         os.path.join(target_dir, "training.1600000.processed.noemoticon.csv"),
         os.path.join(target_dir, "training.csv"),
         os.path.join(target_dir, "data.csv"),
     ]
-    # If a zip exists, unzip it
-    zfiles = [f for f in os.listdir(target_dir) if f.endswith(".zip")]
-    if zfiles:
-        zf = os.path.join(target_dir, zfiles[0])
-        with zipfile.ZipFile(zf, "r") as z:
-            z.extractall(target_dir)
-    # search for known csv
-    for p in possible_csvs:
-        if os.path.exists(p):
-            return p
-    # fallback: find any csv in dir
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    # fallback: any csv
     csvs = [os.path.join(target_dir, f) for f in os.listdir(target_dir) if f.endswith(".csv")]
     if csvs:
         return csvs[0]
-    raise FileNotFoundError("Could not find CSV after downloading. Check Kaggle dataset contents.")
+    raise FileNotFoundError("CSV not found after Kaggle download. Inspect target directory.")
 
-# -----------------------
-# Text cleaning
-# -----------------------
 def clean_text(s):
     s = "" if pd.isna(s) else str(s)
     s = s.lower()
@@ -69,21 +96,14 @@ def clean_text(s):
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
-# -----------------------
-# Train pipeline
-# -----------------------
 def train_pipeline(csv_path, subset_size=30000, test_frac=0.15, random_state=42):
-    # load with Sentiment140 column names if no header
     cols = ['target','id','date','query','user','text']
     df = pd.read_csv(csv_path, header=None, names=cols, encoding='latin-1')
     df = df[df['target'].isin([0,4])]
     df = df[['target','text']].dropna().copy()
-    # map labels
     df['label_text'] = df['target'].map({0:'negative', 4:'positive'})
-    # sample for speed
     if subset_size and subset_size < len(df):
         df = df.sample(subset_size, random_state=random_state).reset_index(drop=True)
-    # clean
     df['text_clean'] = df['text'].apply(clean_text)
     X = df['text_clean'].values
     y = df['label_text'].values
@@ -104,9 +124,6 @@ def train_pipeline(csv_path, subset_size=30000, test_frac=0.15, random_state=42)
     pipeline = {"vectorizer": vec, "classifier": clf}
     return pipeline, metrics, (X_test, y_test, y_pred)
 
-# -----------------------
-# Plot helpers
-# -----------------------
 def plot_confusion(cm, labels=['negative','positive']):
     fig, ax = plt.subplots(figsize=(4,4))
     im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -120,56 +137,117 @@ def plot_confusion(cm, labels=['negative','positive']):
     plt.tight_layout()
     return fig
 
-# -----------------------
-# Streamlit UI
-# -----------------------
-st.set_page_config(page_title="Tweet Sentiment (Kaggle) Demo", layout="wide")
-st.title("Tweet Sentiment Classifier — Train from Kaggle dataset")
+def plot_roc_pr(y_true, y_score):
+    fig1, ax1 = plt.subplots()
+    fpr, tpr, _ = roc_curve(y_true, y_score[:,1])
+    roc_auc = auc(fpr, tpr)
+    ax1.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+    ax1.plot([0,1],[0,1],'--')
+    ax1.set_xlabel("False Positive Rate"); ax1.set_ylabel("True Positive Rate"); ax1.set_title("ROC Curve"); ax1.legend()
+    fig2, ax2 = plt.subplots()
+    precision, recall, _ = precision_recall_curve(y_true, y_score[:,1])
+    ap = average_precision_score(y_true, y_score[:,1])
+    ax2.plot(recall, precision, label=f"AP = {ap:.3f}")
+    ax2.set_xlabel("Recall"); ax2.set_ylabel("Precision"); ax2.set_title("Precision-Recall"); ax2.legend()
+    plt.tight_layout()
+    return fig1, fig2
 
-st.sidebar.header("Kaggle + Training")
-st.sidebar.markdown("Ensure Kaggle credentials present: `~/.kaggle/kaggle.json` or env vars.")
-download_button = st.sidebar.button("Download Sentiment140 from Kaggle")
+# ---- Streamlit UI ----
+st.set_page_config(page_title="Tweet Sentiment (Kaggle Auto)", layout="wide")
+st.title("Tweet Sentiment Classifier — Kaggle Auto-Install + Credential Check")
+
+st.sidebar.header("Setup & Kaggle")
+cred_ok, cred_msg = has_kaggle_credentials()
+st.sidebar.write(f"Local kaggle credential: {cred_ok}")
+if cred_ok:
+    st.sidebar.write(f"Credential location: {cred_msg}")
+else:
+    st.sidebar.info("No local kaggle.json found. You can set KAGGLE_USERNAME and KAGGLE_KEY env vars or place kaggle.json in ~/.kaggle/")
+
+auth_check = st.sidebar.button("Validate Kaggle Authentication")
+if auth_check:
+    ok, msg = validate_kaggle_access()
+    if ok:
+        st.sidebar.success("Kaggle authenticated.")
+    else:
+        st.sidebar.error(msg)
+
+st.sidebar.markdown("---")
 data_dir = st.sidebar.text_input("Data directory", value="data")
-subset_size = st.sidebar.number_input("Subset size (for training)", min_value=5000, max_value=1600000, value=30000, step=5000)
-test_frac = st.sidebar.slider("Test set fraction", 0.05, 0.3, 0.15)
+download_btn = st.sidebar.button("Download Sentiment140 from Kaggle")
+
+subset_size = st.sidebar.number_input("Subset size (train)", min_value=5000, max_value=1600000, value=30000, step=5000)
+test_frac = st.sidebar.slider("Test fraction", 0.05, 0.3, 0.15)
 
 csv_path = None
-if download_button:
-    with st.spinner("Downloading dataset from Kaggle..."):
-        try:
-            csv_path = download_sentiment140_kaggle(target_dir=data_dir)
-            st.success(f"Downloaded dataset CSV: {csv_path}")
-        except Exception as e:
-            st.error(f"Download failed: {e}")
-            st.stop()
+if download_btn:
+    ok, _ = validate_kaggle_access()
+    if not ok:
+        st.error("Kaggle credentials invalid. Fix credentials and retry.")
+    else:
+        with st.spinner("Downloading Sentiment140 via Kaggle API..."):
+            try:
+                csv_path = download_sentiment140_kaggle(target_dir=data_dir)
+                st.success(f"Downloaded dataset CSV: {csv_path}")
+            except Exception as e:
+                st.error(f"Download failed: {e}")
+                csv_path = None
 
-# If user manually set path
-if csv_path is None:
-    # check common locations
-    candidates = [
-        os.path.join(data_dir, "training.1600000.processed.noemoticon.csv"),
-        os.path.join(data_dir, "training.csv"),
-        os.path.join(data_dir, "data.csv")
-    ]
-    for c in candidates:
-        if os.path.exists(c):
-            csv_path = c
-            break
+# Allow user to optionally point to existing CSV
+st.sidebar.markdown("Or specify local CSV path if already downloaded")
+local_csv = st.sidebar.text_input("Local CSV path (optional)", value="")
+if local_csv:
+    if os.path.exists(local_csv):
+        csv_path = local_csv
+        st.sidebar.success(f"Using local CSV: {csv_path}")
+    else:
+        st.sidebar.warning("Local CSV path not found.")
 
+# If csv found, allow training
 if csv_path and os.path.exists(csv_path):
-    st.sidebar.success(f"Using CSV: {csv_path}")
-    if st.sidebar.button("Train Model Now"):
-        with st.spinner("Training model... this may take a while depending on subset size"):
-            pipeline, metrics, test_data = train_pipeline(csv_path, subset_size=int(subset_size), test_frac=float(test_frac))
-            # save to session
-            st.session_state['pipeline'] = pipeline
-            st.session_state['metrics'] = metrics
-            st.session_state['test_data'] = test_data
-            # save files
-            os.makedirs("models", exist_ok=True)
-            joblib.dump(pipeline['vectorizer'], "models/tfidf_vectorizer.joblib")
-            joblib.dump(pipeline['classifier'], "models/logreg_classifier.joblib")
-            st.success("Training complete. Models saved to /models/*.joblib")
+    st.success(f"Dataset ready: {csv_path}")
+    if st.button("Train Model Now"):
+        with st.spinner("Training model (this may take minutes depending on subset)..."):
+            try:
+                pipeline, metrics, test_data = train_pipeline(csv_path, subset_size=int(subset_size), test_frac=float(test_frac))
+                st.session_state['pipeline'] = pipeline
+                st.session_state['metrics'] = metrics
+                st.session_state['test_data'] = test_data
+                os.makedirs("models", exist_ok=True)
+                joblib.dump(pipeline['vectorizer'], "models/tfidf_vectorizer.joblib")
+                joblib.dump(pipeline['classifier'], "models/logreg_classifier.joblib")
+                st.success("Training complete. Artifacts saved under ./models/")
+            except Exception as e:
+                st.error(f"Training failed: {e}")
+
+# If user uploaded CSV manually, allow training from upload
+st.header("Alternative: Upload CSV and train (smaller subsets recommended)")
+uploaded = st.file_uploader("Upload Sentiment CSV (optional)", type=["csv"])
+if uploaded is not None:
+    try:
+        tmp_df = pd.read_csv(uploaded)
+        st.write("Uploaded sample:")
+        st.dataframe(tmp_df.head())
+        if st.button("Train on uploaded CSV"):
+            # Save uploaded to temp and train using same pipeline (assume Sentiment140 format or columns target/text)
+            tmp_path = "uploaded_sentiment.csv"
+            uploaded.seek(0)
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getvalue())
+            # try to detect format; if header exists try to use columns
+            try:
+                pipeline, metrics, test_data = train_pipeline(tmp_path, subset_size=int(subset_size), test_frac=float(test_frac))
+                st.session_state['pipeline'] = pipeline
+                st.session_state['metrics'] = metrics
+                st.session_state['test_data'] = test_data
+                os.makedirs("models", exist_ok=True)
+                joblib.dump(pipeline['vectorizer'], "models/tfidf_vectorizer.joblib")
+                joblib.dump(pipeline['classifier'], "models/logreg_classifier.joblib")
+                st.success("Training on uploaded CSV complete.")
+            except Exception as e:
+                st.error(f"Training on uploaded CSV failed: {e}")
+    except Exception as e:
+        st.error(f"Could not read uploaded CSV: {e}")
 
 # Show metrics if available
 if 'metrics' in st.session_state:
@@ -182,7 +260,7 @@ if 'metrics' in st.session_state:
     st.pyplot(plot_confusion(m['confusion_matrix']))
 
 # Prediction UI
-st.header("Prediction")
+st.header("Prediction Demo")
 input_text = st.text_area("Enter a tweet to classify", height=120)
 if st.button("Predict") and 'pipeline' in st.session_state:
     vec = st.session_state['pipeline']['vectorizer']
@@ -199,27 +277,29 @@ if st.button("Predict") and 'pipeline' in st.session_state:
     if prob is not None:
         st.write(f"Probability (max): {prob:.3f}")
 
-# Batch prediction from uploaded CSV (must have 'text' column)
-st.header("Batch Prediction (Upload CSV with 'text' column)")
-uploaded = st.file_uploader("Upload CSV", type=['csv'])
-if uploaded is not None and 'pipeline' in st.session_state:
-    dfu = pd.read_csv(uploaded)
-    if 'text' not in dfu.columns:
-        st.error("CSV must contain a 'text' column.")
-    else:
-        dfu['text_clean'] = dfu['text'].astype(str).apply(clean_text)
-        vec = st.session_state['pipeline']['vectorizer']
-        clf = st.session_state['pipeline']['classifier']
-        Xv = vec.transform(dfu['text_clean'])
-        preds = clf.predict(Xv)
-        dfu['predicted'] = preds
-        try:
-            dfu['prob_positive'] = clf.predict_proba(Xv)[:,1]
-        except Exception:
-            pass
-        st.dataframe(dfu.head(50))
-        csv_out = dfu.to_csv(index=False).encode('utf-8')
-        st.download_button("Download predictions", data=csv_out, file_name="predictions.csv", mime="text/csv")
+# Batch prediction for user-uploaded csv with 'text' column
+st.header("Batch Prediction (CSV with 'text' column)")
+batch_uploaded = st.file_uploader("Upload CSV for batch prediction", type=["csv"], key="batch")
+if batch_uploaded is not None and 'pipeline' in st.session_state:
+    try:
+        dfu = pd.read_csv(batch_uploaded)
+        if 'text' not in dfu.columns:
+            st.error("CSV must contain a 'text' column.")
+        else:
+            dfu['text_clean'] = dfu['text'].astype(str).apply(clean_text)
+            vec = st.session_state['pipeline']['vectorizer']
+            clf = st.session_state['pipeline']['classifier']
+            Xv = vec.transform(dfu['text_clean'])
+            preds = clf.predict(Xv)
+            dfu['predicted'] = preds
+            try:
+                dfu['prob_positive'] = clf.predict_proba(Xv)[:,1]
+            except Exception:
+                pass
+            st.dataframe(dfu.head(50))
+            csv_out = dfu.to_csv(index=False).encode('utf-8')
+            st.download_button("Download predictions CSV", data=csv_out, file_name="predictions.csv", mime="text/csv")
+    except Exception as e:
+        st.error(f"Batch prediction failed: {e}")
 
 st.markdown("---")
-st.caption("This demo trains a TF-IDF + Logistic Regression baseline on Sentiment140 downloaded via Kaggle API.")

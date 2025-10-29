@@ -207,18 +207,64 @@ if local_csv:
 if csv_path and os.path.exists(csv_path):
     st.success(f"Dataset ready: {csv_path}")
     if st.button("Train Model Now"):
-        with st.spinner("Training model (this may take minutes depending on subset)..."):
+        with st.status("🚀 Starting training...", expanded=True) as status:
             try:
-                pipeline, metrics, test_data = train_pipeline(csv_path, subset_size=int(subset_size), test_frac=float(test_frac))
-                st.session_state['pipeline'] = pipeline
-                st.session_state['metrics'] = metrics
-                st.session_state['test_data'] = test_data
+                st.write("1️⃣ Loading and cleaning dataset...")
+                cols = ['target','id','date','query','user','text']
+                df = pd.read_csv(csv_path, header=None, names=cols, encoding='latin-1')
+                df = df[df['target'].isin([0,4])]
+                df = df[['target','text']].dropna().copy()
+                df['label_text'] = df['target'].map({0:'negative', 4:'positive'})
+                if subset_size and subset_size < len(df):
+                    df = df.sample(int(subset_size), random_state=42).reset_index(drop=True)
+                df['text_clean'] = df['text'].astype(str).apply(clean_text)
+                st.write(f"✅ Loaded {len(df)} samples")
+
+                progress = st.progress(0)
+                st.write("2️⃣ Splitting data...")
+                X = df['text_clean'].values
+                y = df['label_text'].values
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=float(test_frac), stratify=y, random_state=42
+                )
+                progress.progress(20)
+
+                st.write("3️⃣ Vectorizing text with TF-IDF...")
+                vec = TfidfVectorizer(max_features=10000, ngram_range=(1,2))
+                X_train_vec = vec.fit_transform(X_train)
+                X_test_vec = vec.transform(X_test)
+                progress.progress(50)
+
+                st.write("4️⃣ Training Logistic Regression model...")
+                clf = LogisticRegression(max_iter=1000, C=1.0)
+                clf.fit(X_train_vec, y_train)
+                progress.progress(80)
+
+                st.write("5️⃣ Evaluating model...")
+                y_pred = clf.predict(X_test_vec)
+                acc = accuracy_score(y_test, y_pred)
+                prec = precision_score(y_test, y_pred, pos_label='positive')
+                rec = recall_score(y_test, y_pred, pos_label='positive')
+                f1 = f1_score(y_test, y_pred, pos_label='positive')
+                cm = confusion_matrix(y_test, y_pred, labels=['negative','positive'])
+                progress.progress(100)
+
+                st.session_state['pipeline'] = {'vectorizer': vec, 'classifier': clf}
+                st.session_state['metrics'] = {
+                    'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1, 'cm': cm
+                }
                 os.makedirs("models", exist_ok=True)
-                joblib.dump(pipeline['vectorizer'], "models/tfidf_vectorizer.joblib")
-                joblib.dump(pipeline['classifier'], "models/logreg_classifier.joblib")
-                st.success("Training complete. Artifacts saved under ./models/")
+                joblib.dump(vec, "models/tfidf_vectorizer.joblib")
+                joblib.dump(clf, "models/logreg_classifier.joblib")
+
+                st.success("✅ Training complete!")
+                st.write(f"Accuracy: {acc:.4f}, Precision: {prec:.4f}, Recall: {rec:.4f}, F1: {f1:.4f}")
+                st.pyplot(plot_confusion(cm))
+                status.update(label="🎯 Training completed successfully!", state="complete", expanded=False)
             except Exception as e:
                 st.error(f"Training failed: {e}")
+                status.update(label="❌ Training failed", state="error", expanded=True)
+
 
 # If user uploaded CSV manually, allow training from upload
 st.header("Alternative: Upload CSV and train (smaller subsets recommended)")

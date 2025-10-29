@@ -1,0 +1,14 @@
+# Core
+streamlit==1.39.0
+pandas==2.2.3
+numpy==1.26.4
+scikit-learn==1.5.2
+joblib==1.4.2
+matplotlib==3.9.2
+
+# Kaggle API
+kaggle==1.6.17
+
+# Utility / optional (recommended)
+requests==2.32.3
+tqdm==4.66.4

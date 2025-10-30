@@ -179,69 +179,60 @@ except Exception as e:
     st.stop()
 
 if st.button("Prepare & Train"):
-    # feedback placeholders
     status = st.empty()
     progress = st.progress(0)
-    try:
-        status.info("1/5 — Preparing dataframe (detecting columns)...")
-        time.sleep(0.3)
-        df = prepare_dataframe(uploaded_file)
-        progress.progress(10)
-        status.info(f"2/5 — Cleaning text and sampling {min(subset_size, len(df))} rows...")
-        time.sleep(0.2)
-        progress.progress(30)
-        # train
-        status.info("3/5 — Splitting and vectorizing...")
-        st.experimental_rerun()  # force UI refresh to show progress ASAP (safe here)
-    except Exception as e:
-        st.error(f"Preparation failed: {e}")
-        progress.progress(0)
-        status.error("Preparation failed.")
-        st.stop()
 
-    # Actually train (in a block without experimental_rerun to finish)
     try:
-        # Re-load and prepare (file-like was consumed earlier)
-        if hasattr(uploaded_file, "seek"):
-            uploaded_file.seek(0)
-        df = prepare_dataframe(uploaded_file)
+        status.info("1/5 — Reading uploaded CSV...")
+        time.sleep(0.3)
+
+        # ✅ Correct: read CSV into a DataFrame first
+        df_raw = detect_and_load_csv(uploaded_file)
+        st.write(f"Detected columns: {list(df_raw.columns[:10])}")
+
+        status.info("2/5 — Preparing dataframe (cleaning text, mapping labels)...")
+        df = prepare_dataframe(df_raw)
         progress.progress(20)
-        pipeline, metrics, test_data = train_and_evaluate(df, subset_size=int(subset_size), test_frac=float(test_frac), max_features=int(max_features))
-        vec = pipeline['vectorizer']; clf = pipeline['classifier']
+
+        status.info(f"3/5 — Training model on {min(subset_size, len(df))} samples...")
+        pipeline, metrics, test_data = train_and_evaluate(
+            df,
+            subset_size=int(subset_size),
+            test_frac=float(test_frac),
+            max_features=int(max_features)
+        )
         progress.progress(80)
-        # save artifacts
+
+        # Save artifacts
         os.makedirs("models", exist_ok=True)
-        vec_path = os.path.join("models", "tfidf_vectorizer.joblib")
-        clf_path = os.path.join("models", "logreg_classifier.joblib")
-        joblib.dump(vec, vec_path)
-        joblib.dump(clf, clf_path)
+        joblib.dump(pipeline['vectorizer'], "models/tfidf_vectorizer.joblib")
+        joblib.dump(pipeline['classifier'], "models/logreg_classifier.joblib")
+
         progress.progress(100)
-        status.success("Training complete. Models saved to ./models/")
-        # store in session
+        status.success("✅ Training complete. Models saved to ./models/")
+
         st.session_state['pipeline'] = pipeline
         st.session_state['metrics'] = metrics
         st.session_state['test_data'] = test_data
-        # display metrics
+
         st.subheader("Evaluation (hold-out test)")
         st.write(f"Accuracy: **{metrics['accuracy']:.4f}**")
         st.write(f"Precision: **{metrics['precision']:.4f}**")
         st.write(f"Recall: **{metrics['recall']:.4f}**")
         st.write(f"F1: **{metrics['f1']:.4f}**")
+
         classes = metrics.get('classes', [])
-        cm = metrics['confusion_matrix']
-        st.pyplot(plot_confusion(cm, classes))
-        # ROC & PR
+        st.pyplot(plot_confusion(metrics['confusion_matrix'], classes))
+
         X_test, y_test, y_pred, proba = test_data
         roc_fig, pr_fig = plot_roc_pr(y_test, proba, classes)
-        if roc_fig:
-            st.pyplot(roc_fig)
-        if pr_fig:
-            st.pyplot(pr_fig)
+        if roc_fig: st.pyplot(roc_fig)
+        if pr_fig: st.pyplot(pr_fig)
+
     except Exception as e:
         st.error(f"Training failed: {e}")
         progress.progress(0)
         status.error("Training failed.")
-        st.stop()
 
 # -----------------------
 # UI: Single prediction
